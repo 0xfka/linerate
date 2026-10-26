@@ -1,0 +1,10 @@
+# do pre-commit install --config .githooks/.pre-commit-config.yaml
+# once
+repos:
+  - repo: local
+    hooks:
+      - id: clang-format
+        name: clang-format
+        entry: clang-format -i
+        language: system
+        types_or: [c, c++]
