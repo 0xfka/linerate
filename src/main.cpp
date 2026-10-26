@@ -1,10 +1,10 @@
 #include <errno.h>
 #include <fcntl.h>
-#include <liburing.h>  // TODO: we really need 2 of io_uring libs ?
+#include <liburing.h> // TODO: we really need 2 of io_uring libs ?
 #include <liburing/io_uring.h>
-#include <stdio.h>  // fopen syscall
+#include <stdio.h> // fopen syscall
 #include <string.h>
-#include <sys/mman.h>  // hugepages
+#include <sys/mman.h> // hugepages
 #include <unistd.h>
 
 #include <cstdlib>
@@ -23,9 +23,9 @@
  *
  */
 // io_uring parameters, currently placehodlers. NOT profiled.
-constexpr uint BLOCK_SZ = 2048;
+constexpr uint BLOCK_SZ = 128;
 /* arg1 : pcapng path */
-int main(int argc, char* argv[]) {
+int main(int argc, char *argv[]) {
   // argv[0] is bin name already
   if (argc != 2) [[unlikely]] {
     return EINVAL;
@@ -39,17 +39,20 @@ int main(int argc, char* argv[]) {
      for prefetching at DRAM since fetching at NVMe at line rate of
      10G/25G would be impossible.
      TODO: This part needs to be documented */
-  constexpr std::size_t hugepage_sz = 1 << 30;  // 1 GiB
-  void* p =
+  constexpr std::size_t hugepage_sz = 1 << 30; // 1 GiB
+  void *p =
       mmap(NULL, hugepage_sz, PROT_READ | PROT_WRITE,
            MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE | MAP_HUGE_1GB, -1, 0);
   if (p == MAP_FAILED) [[unlikely]] {
     return errno;
   }
+  const ulong file_sz = lseek(fd, 0, SEEK_END);
+  if (file_sz == (ulong)-1)
+    return errno;
   // map_populate should already preventing page faults..
   memset(p, 0, 1 << 30);
-  struct io_uring_sqe* sqe;
-  struct io_uring_cqe* cqe;
+  struct io_uring_sqe *sqe;
+  struct io_uring_cqe *cqe;
   struct io_uring_params conf;
   memset(&conf, 0, sizeof(io_uring_params));
   conf.flags = IORING_SETUP_SQPOLL /* Poll SQ instead of waiting for a syscall
@@ -59,7 +62,7 @@ int main(int argc, char* argv[]) {
   conf.sq_thread_idle = 20000;
   struct io_uring ring;
   // TODO: some syscalls sets errno at err, some return the error code itself ?
-  // Mayba standardize somehow, such as, a TEST() macro ?
+  // Maybe standardize somehow, such as, a TEST() macro ?
   int err = io_uring_queue_init_params(BLOCK_SZ, &ring, &conf);
   if (err != 0) [[unlikely]] {
     return -err;
@@ -70,12 +73,30 @@ int main(int argc, char* argv[]) {
     return errno;
   }
   sqe = io_uring_get_sqe(&ring);
-  unsigned long long curr = 0;
-  // read first 1 gb of given file
+  ulong curr = 0;
+  /* Read 1 GiB if left, everything if not.
+     Since the pcapng files we are going to use needs to be
+     huge, 1 GiB selection may needs to be reconsidered again in the future.
+    */
   // TODO: Probably use registered buffers
-  io_uring_prep_read(sqe, 0, p, hugepage_sz, curr);
+  ulong read;
+  read = hugepage_sz + curr > file_sz ? file_sz - curr : hugepage_sz;
+  io_uring_prep_read(sqe, 0, p, read, curr);
+  curr += read;
   io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
   io_uring_submit(&ring);
   io_uring_wait_cqe(&ring, &cqe);
+  uint temp_check_block_type;
+  memcpy(&temp_check_block_type, (const uint8_t *)p, 4);
+  if (temp_check_block_type != 168627466) [[unlikely]] {
+    return -1;
+  }
+  uint block_len;
+  memcpy(&block_len, (const uint8_t *)p + 4, 4);
+  uint temp_magic;
+  memcpy(&temp_magic, (const uint8_t *)p + 8, 4);
+  if (temp_magic != 439041101) [[unlikely]] {
+    return -1;
+  }
   return 0;
 }
