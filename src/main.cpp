@@ -1,0 +1,81 @@
+#include <errno.h>
+#include <fcntl.h>
+#include <liburing.h>  // TODO: we really need 2 of io_uring libs ?
+#include <liburing/io_uring.h>
+#include <stdio.h>  // fopen syscall
+#include <string.h>
+#include <sys/mman.h>  // hugepages
+#include <unistd.h>
+
+#include <cstdlib>
+
+#include "util.hpp"
+/*  CPU affinities and multi-core
+ *  Targeted zen microarchitectures contains 8 core per core complex, so
+ *  multi core can go up to 8 without cross CCX latencies.
+ *  Multi threading is disabled to prevent CPU trashing and for this purpose,
+ *  The sibling threads of given cores will be disabled.
+ *  JOBS REQUIRING A SEPERATED CORE :
+ *  1 ) The binary itself. Core 0
+ *  2 ) Polling io_uring, this core will be set to sq_thread_cpu, core 1.
+ *
+ *  This part will be updated when other work requires a seperated core.
+ *
+ */
+// io_uring parameters, currently placehodlers. NOT profiled.
+constexpr uint BLOCK_SZ = 2048;
+/* arg1 : pcapng path */
+int main(int argc, char* argv[]) {
+  // argv[0] is bin name already
+  if (argc != 2) [[unlikely]] {
+    return EINVAL;
+  }
+  const int fd = open(argv[1], O_DIRECT);
+  if (fd == -1) [[unlikely]] {
+    return errno;
+  }
+  /* set hugepages
+     This project will probably require GB's of hugepage,
+     for prefetching at DRAM since fetching at NVMe at line rate of
+     10G/25G would be impossible.
+     TODO: This part needs to be documented */
+  constexpr std::size_t hugepage_sz = 1 << 30;  // 1 GiB
+  void* p =
+      mmap(NULL, hugepage_sz, PROT_READ | PROT_WRITE,
+           MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE | MAP_HUGE_1GB, -1, 0);
+  if (p == MAP_FAILED) [[unlikely]] {
+    return errno;
+  }
+  // map_populate should already preventing page faults..
+  memset(p, 0, 1 << 30);
+  struct io_uring_sqe* sqe;
+  struct io_uring_cqe* cqe;
+  struct io_uring_params conf;
+  memset(&conf, 0, sizeof(io_uring_params));
+  conf.flags = IORING_SETUP_SQPOLL /* Poll SQ instead of waiting for a syscall
+                                       to pick up */
+               | IORING_SETUP_SQ_AFF /* affinity */;
+  conf.sq_thread_cpu = 1;
+  conf.sq_thread_idle = 20000;
+  struct io_uring ring;
+  // TODO: some syscalls sets errno at err, some return the error code itself ?
+  // Mayba standardize somehow, such as, a TEST() macro ?
+  int err = io_uring_queue_init_params(BLOCK_SZ, &ring, &conf);
+  if (err != 0) [[unlikely]] {
+    return -err;
+  }
+  if (io_uring_register_files(&ring, &fd, 1) != 0) [[unlikely]] {
+    // TODO: some syscalls returns errno at err, and some does -errno. Should we
+    // do -errno when return to normalize or, something else like that ?
+    return errno;
+  }
+  sqe = io_uring_get_sqe(&ring);
+  unsigned long long curr = 0;
+  // read first 1 gb of given file
+  // TODO: Probably use registered buffers
+  io_uring_prep_read(sqe, 0, p, hugepage_sz, curr);
+  io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
+  io_uring_submit(&ring);
+  io_uring_wait_cqe(&ring, &cqe);
+  return 0;
+}
