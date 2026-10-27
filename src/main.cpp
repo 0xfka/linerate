@@ -9,7 +9,6 @@
 
 #include <cstdlib>
 
-#include "util.hpp"
 /*  CPU affinities and multi-core
  *  Targeted zen microarchitectures contains 8 core per core complex, so
  *  multi core can go up to 8 without cross CCX latencies.
