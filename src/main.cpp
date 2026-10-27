@@ -7,6 +7,7 @@
 #include <sys/mman.h> // hugepages
 #include <unistd.h>
 
+#include "pcapng.hpp"
 #include <cstdlib>
 
 /*  CPU affinities and multi-core
@@ -39,12 +40,13 @@ int main(int argc, char *argv[]) {
      10G/25G would be impossible.
      TODO: This part needs to be documented */
   constexpr std::size_t hugepage_sz = 1 << 30; // 1 GiB
-  void *p =
+  void *mem =
       mmap(NULL, hugepage_sz, PROT_READ | PROT_WRITE,
            MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE | MAP_HUGE_1GB, -1, 0);
-  if (p == MAP_FAILED) [[unlikely]] {
+  if (mem == MAP_FAILED) [[unlikely]] {
     return errno;
   }
+  std::uint8_t *p = reinterpret_cast<std::uint8_t *>(mem);
   const ulong file_sz = lseek(fd, 0, SEEK_END);
   if (file_sz == (ulong)-1)
     return errno;
@@ -72,30 +74,28 @@ int main(int argc, char *argv[]) {
     return errno;
   }
   sqe = io_uring_get_sqe(&ring);
-  ulong curr = 0;
+  [[maybe_unused]] std::uint32_t curr = 0;
+  ulong valid = 0; // the biggest number that can be readed as p + valid
   /* Read 1 GiB if left, everything if not.
      Since the pcapng files we are going to use needs to be
      huge, 1 GiB selection may needs to be reconsidered again in the future.
     */
   // TODO: Probably use registered buffers
   ulong read;
-  read = hugepage_sz + curr > file_sz ? file_sz - curr : hugepage_sz;
-  io_uring_prep_read(sqe, 0, p, read, curr);
-  curr += read;
+  read = hugepage_sz + valid > file_sz ? file_sz - valid : hugepage_sz;
+  io_uring_prep_read(sqe, 0, p, read, valid);
+  valid += read;
   io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
   io_uring_submit(&ring);
   io_uring_wait_cqe(&ring, &cqe);
-  uint temp_check_block_type;
-  memcpy(&temp_check_block_type, (const uint8_t *)p, 4);
-  if (temp_check_block_type != 168627466) [[unlikely]] {
+  SectionHeaderBlock *shb = (SectionHeaderBlock *)p;
+  // TODO: block type is palindrome and it always passes if the file is a valid
+  // pcapng
+  if (shb->block_type != block_type_expected) [[unlikely]] {
     return -1;
   }
-  uint block_len;
-  memcpy(&block_len, (const uint8_t *)p + 4, 4);
-  uint temp_magic;
-  memcpy(&temp_magic, (const uint8_t *)p + 8, 4);
-  if (temp_magic != 439041101) [[unlikely]] {
-    return -1;
+  if (shb->byte_order_magic != byte_order_magic_expected) [[unlikely]] {
+    return -1; // Big endian not supported on parsing
   }
   return 0;
 }
