@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <liburing.h> // TODO: we really need 2 of io_uring libs ?
 #include <liburing/io_uring.h>
+#include <linux/memfd.h>
 #include <stdio.h> // fopen syscall
 #include <string.h>
 #include <sys/mman.h> // hugepages
@@ -34,18 +35,38 @@ int main(int argc, char *argv[]) {
   if (fd == -1) [[unlikely]] {
     return errno;
   }
-  /* set hugepages
-     This project will probably require GB's of hugepage,
-     for prefetching at DRAM since fetching at NVMe at line rate of
-     10G/25G would be impossible.
-     TODO: This part needs to be documented */
+  /* Infinite buffer trick
+     2x virtual memory space of the physical ram,
+     first one is between 0 and sz, both phyiscally and virtually.
+     The second one is starting from sz + 1 virtually, and goes up to sz * 2,
+     whihe it also writes to phyiscally 0 and sz, this means, if we pass sz when
+     writing, it'll wrap around and write it to the start.
+  */
   constexpr std::size_t hugepage_sz = 1 << 30; // 1 GiB
-  void *mem =
-      mmap(NULL, hugepage_sz, PROT_READ | PROT_WRITE,
-           MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE | MAP_HUGE_1GB, -1, 0);
-  if (mem == MAP_FAILED) [[unlikely]] {
+  int memfd = memfd_create("inf", MFD_HUGETLB | MFD_HUGE_1GB);
+  if (memfd == -1) {
     return errno;
   }
+  void *virt =
+      mmap(nullptr, 2 * hugepage_sz, PROT_NONE,
+           MAP_ANONYMOUS | MAP_PRIVATE | MAP_HUGETLB | MAP_HUGE_1GB, -1,
+           0); // virtual memory address space
+  if (virt == MAP_FAILED) {
+    return errno;
+  }
+
+  void *mem =
+      mmap(virt, hugepage_sz, PROT_READ | PROT_WRITE,
+           MAP_FIXED | MAP_SHARED | MAP_POPULATE | MAP_HUGETLB | MAP_HUGE_1GB,
+           memfd, 0);
+  void *mem2 =
+      mmap((uint8_t *)virt + hugepage_sz, hugepage_sz, PROT_READ | PROT_WRITE,
+           MAP_FIXED | MAP_SHARED | MAP_POPULATE | MAP_HUGETLB | MAP_HUGE_1GB,
+           memfd, 0);
+  if (mem == MAP_FAILED | mem2 == MAP_FAILED) [[unlikely]] {
+    return errno;
+  }
+  memset(mem, 0, hugepage_sz);
   std::uint8_t *p = reinterpret_cast<std::uint8_t *>(mem);
   const ulong file_sz = lseek(fd, 0, SEEK_END);
   if (file_sz == (ulong)-1)
@@ -74,23 +95,23 @@ int main(int argc, char *argv[]) {
     return errno;
   }
   sqe = io_uring_get_sqe(&ring);
-  [[maybe_unused]] std::uint32_t curr = 0;
-  ulong valid = 0; // the biggest number that can be readed as p + valid
   /* Read 1 GiB if left, everything if not.
      Since the pcapng files we are going to use needs to be
      huge, 1 GiB selection may needs to be reconsidered again in the future.
     */
   // TODO: Probably use registered buffers
   ulong read;
-  read = hugepage_sz + valid > file_sz ? file_sz - valid : hugepage_sz;
-  io_uring_prep_read(sqe, 0, p, read, valid);
-  valid += read;
+  std::uint32_t file_curr = 0;
+  read = hugepage_sz + file_curr > file_sz ? file_sz - file_curr : hugepage_sz;
+  io_uring_prep_read(sqe, 0, p, read, file_curr);
+  file_curr += read;
   io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
   io_uring_submit(&ring);
   io_uring_wait_cqe(&ring, &cqe);
   SectionHeaderBlock *shb = (SectionHeaderBlock *)p;
-  // TODO: block type is palindrome and it always passes if the file is a valid
-  // pcapng
+  // block type is palindrome and at most, this check can only validate the file
+  // looks like a pcapng file. This checks are probably unnecessary because the
+  // parser will don't support malformed pcapng files.
   if (shb->block_type != block_type_expected) [[unlikely]] {
     return -1;
   }
