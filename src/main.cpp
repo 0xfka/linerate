@@ -11,19 +11,6 @@
 #include "pcapng.hpp"
 #include <cstdlib>
 
-/*  CPU affinities and multi-core
- *  Targeted zen microarchitectures contains 8 core per core complex, so
- *  multi core can go up to 8 without cross CCX latencies.
- *  Multi threading is disabled to prevent CPU trashing and for this purpose,
- *  The sibling threads of given cores will be disabled.
- *  JOBS REQUIRING A SEPERATED CORE :
- *  1 ) The binary itself. Core 0
- *  2 ) Polling io_uring, this core will be set to sq_thread_cpu, core 1.
- *
- *  This part will be updated when other work requires a seperated core.
- *
- */
-// io_uring parameters, currently placehodlers. NOT profiled.
 constexpr uint BLOCK_SZ = 128;
 /* arg1 : pcapng path */
 int main(int argc, char *argv[]) {
@@ -35,13 +22,6 @@ int main(int argc, char *argv[]) {
   if (fd == -1) [[unlikely]] {
     return errno;
   }
-  /* Infinite buffer trick
-     2x virtual memory space of the physical ram,
-     first one is between 0 and sz, both phyiscally and virtually.
-     The second one is starting from sz + 1 virtually, and goes up to sz * 2,
-     whihe it also writes to phyiscally 0 and sz, this means, if we pass sz when
-     writing, it'll wrap around and write it to the start.
-  */
   constexpr std::size_t hugepage_sz = 1 << 30; // 1 GiB
   int memfd = memfd_create("inf", MFD_HUGETLB | MFD_HUGE_1GB);
   if (memfd == -1) {
@@ -90,15 +70,9 @@ int main(int argc, char *argv[]) {
     return -err;
   }
   if (io_uring_register_files(&ring, &fd, 1) != 0) [[unlikely]] {
-    // TODO: some syscalls returns errno at err, and some does -errno. Should we
-    // do -errno when return to normalize or, something else like that ?
     return errno;
   }
   sqe = io_uring_get_sqe(&ring);
-  /* Read 1 GiB if left, everything if not.
-     Since the pcapng files we are going to use needs to be
-     huge, 1 GiB selection may needs to be reconsidered again in the future.
-    */
   // TODO: Probably use registered buffers
   ulong read;
   std::uint32_t file_curr = 0;

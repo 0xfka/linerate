@@ -8,3 +8,10 @@ repos:
         entry: clang-format -i
         language: system
         types_or: [c, c++]
+      - id: prettier-markdown
+        name: prettier (Markdown)
+        entry: prettier --write
+        language: node
+        language_version: system
+        additional_dependencies: [prettier@3.6.2]
+        types: [markdown]
