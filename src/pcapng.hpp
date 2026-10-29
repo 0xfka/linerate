@@ -3,8 +3,11 @@
 #include <cstdint>
 
 // decimal
-constexpr std::uint32_t block_type_expected = 168627466;
-constexpr std::uint32_t byte_order_magic_expected = 439041101; // little endian
+// e_ = expected
+constexpr std::uint32_t e_shb_block_type = 168627466;
+constexpr std::uint32_t e_byte_order_magic = 439041101; // little endian
+constexpr std::uint8_t e_idb_block_type = 1;
+constexpr std::uint8_t e_epb_block_type = 6;
 
 /* https://pcapng.com/#SHB */
 struct SectionHeaderBlock {

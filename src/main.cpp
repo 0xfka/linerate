@@ -3,6 +3,7 @@
 #include <liburing.h> // TODO: we really need 2 of io_uring libs ?
 #include <liburing/io_uring.h>
 #include <linux/memfd.h>
+#include <span>
 #include <stdio.h> // fopen syscall
 #include <string.h>
 #include <sys/mman.h> // hugepages
@@ -86,11 +87,46 @@ int main(int argc, char *argv[]) {
   // block type is palindrome and at most, this check can only validate the file
   // looks like a pcapng file. This checks are probably unnecessary because the
   // parser will don't support malformed pcapng files.
-  if (shb->block_type != block_type_expected) [[unlikely]] {
+  if (shb->block_type != e_shb_block_type) [[unlikely]] {
     return -1;
   }
-  if (shb->byte_order_magic != byte_order_magic_expected) [[unlikely]] {
+  if (shb->byte_order_magic != e_byte_order_magic) [[unlikely]] {
     return -1; // Big endian not supported on parsing
   }
+  p += shb->block_total_length;
+  InterfaceDescriptionBlock *idb = (InterfaceDescriptionBlock *)p;
+  // TODO: expect idb after fist shb. Is it %100 true ?
+  if (idb->block_type != e_idb_block_type) [[unlikely]] {
+    return -1;
+  }
+  /* Maybe provide telemetry with things like that ?
+     We can read the values by fetching them with Shared state on another
+     seperate core, it's only 1 cmp + 1 add for hot path. But, will use a
+     register or cause a memory fetch?
+  */
+  std::uint32_t truncated_packet_count = 0;
+  p += idb->block_total_length;
+  /* TODO: According to specs, it looks like only enhanced packet block is used
+     at pcapng ? "Packet Block (Appendix A): it contains a single captured
+     packet, or a portion of it.  It is OBSOLETE, and superseded by the Enhanced
+     Packet Block (Section 4.3)."
+      - https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcapng/
+      Maybe only support EPB for every packet block ?  */
+  EnhancedPacketBlock *epb = (EnhancedPacketBlock *)p;
+  if (epb->block_type != e_epb_block_type) [[unlikely]] {
+    return -1;
+  }
+  /* Maybe provide telemetry with things like that ?
+     We can read the values by fetching them with Shared state on another
+     seperate core, it's only 1 cmp + 1 add for hot path. Because every epb has
+     the required values, we don't need seperate registers ( etc, keeping the
+     snap_len after idb)
+  */
+  epb->original_packet_length > epb->captured_packet_length
+      ? ++truncated_packet_count
+      : 0;
+  std::span<std::uint8_t> firstpacket(
+      p + sizeof(EnhancedPacketBlock),
+      epb->captured_packet_length); // temp. for checking firstpacket from GDB
   return 0;
 }
