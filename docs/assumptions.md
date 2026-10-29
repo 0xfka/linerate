@@ -5,6 +5,5 @@ performance.
 
 ### The given pcapng file must :
 
-- Not malformed
-- Contain only 1 interface
-- Little endian pcapng metadata. Packets are not parsed and not included by this line.
+- Not malformed. The parser would just return -1 on any kind of malform,(e.g, file doesn't starts with section header block) instead of any recovery/resync logic.
+- Only little endian is supported for metadata.
