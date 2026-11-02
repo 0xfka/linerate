@@ -9,6 +9,7 @@
 #include <sys/mman.h> // hugepages
 #include <unistd.h>
 
+#include "parser.hpp"
 #include "pcapng.hpp"
 #include <cstdlib>
 
@@ -19,7 +20,7 @@ int main(int argc, char *argv[]) {
   if (argc != 2) [[unlikely]] {
     return EINVAL;
   }
-  const int fd = open(argv[1], O_DIRECT);
+  const int fd = open(argv[1], O_RDONLY | O_DIRECT);
   if (fd == -1) [[unlikely]] {
     return errno;
   }
@@ -58,9 +59,16 @@ int main(int argc, char *argv[]) {
   struct io_uring_cqe *cqe;
   struct io_uring_params conf;
   memset(&conf, 0, sizeof(io_uring_params));
-  conf.flags = IORING_SETUP_SQPOLL /* Poll SQ instead of waiting for a syscall
-                                       to pick up */
-               | IORING_SETUP_SQ_AFF /* affinity */;
+  // IOPOLL polls which core will receive the CQ. Because the SQ is sent by
+  // our polling core, this core also polls for IO.
+  conf.flags =
+      IORING_SETUP_SQPOLL /* Poll SQ instead of waiting for a syscall
+                              to pick up */
+      | IORING_SETUP_SQ_AFF /* affinity */ |
+      IORING_SETUP_IOPOLL /* TODO(doc): Maybe document IOPOLL requirements, such
+                             as filesystem. BTRFS was not supported and XFS is
+                             used for the pcap file.*/
+      ;
   conf.sq_thread_cpu = 1;
   conf.sq_thread_idle = 20000;
   struct io_uring ring;
@@ -73,60 +81,54 @@ int main(int argc, char *argv[]) {
   if (io_uring_register_files(&ring, &fd, 1) != 0) [[unlikely]] {
     return errno;
   }
+  struct iovec iovecs = {.iov_base = mem, .iov_len = hugepage_sz};
+  err = io_uring_register_buffers(&ring, &iovecs, 1);
+  if (err != 0) [[unlikely]] {
+    return -err;
+  }
   sqe = io_uring_get_sqe(&ring);
-  // TODO: Probably use registered buffers
   ulong read;
   std::uint32_t file_curr = 0;
   read = hugepage_sz + file_curr > file_sz ? file_sz - file_curr : hugepage_sz;
-  io_uring_prep_read(sqe, 0, p, read, file_curr);
+  io_uring_prep_read_fixed(sqe, 0, mem, read, file_curr, 0);
   file_curr += read;
   io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
   io_uring_submit(&ring);
-  io_uring_wait_cqe(&ring, &cqe);
-  SectionHeaderBlock *shb = (SectionHeaderBlock *)p;
-  // block type is palindrome and at most, this check can only validate the file
-  // looks like a pcapng file. This checks are probably unnecessary because the
-  // parser will don't support malformed pcapng files.
-  if (shb->block_type != e_shb_block_type) [[unlikely]] {
-    return -1;
+  err = io_uring_wait_cqe(&ring, &cqe);
+  if (err != 0) [[unlikely]] {
+    return err; // if not zero, res is invalid.
   }
-  if (shb->byte_order_magic != e_byte_order_magic) [[unlikely]] {
-    return -1; // Big endian not supported on parsing
+  if (cqe->res < 0) [[unlikely]] {
+    return -cqe->res;
   }
-  p += shb->block_total_length;
-  InterfaceDescriptionBlock *idb = (InterfaceDescriptionBlock *)p;
-  // TODO: expect idb after fist shb. Is it %100 true ?
-  if (idb->block_type != e_idb_block_type) [[unlikely]] {
-    return -1;
+  std::array<std::span<const uint8_t>, 64> pkts;
+  std::uint32_t truncated_pkt_cnt = 0;
+  std::uint8_t idx_pkt = 0; //  batch idx, if 64, send to TX
+  // is this generated a jump table ?
+  HeaderBlockPrefix *&prefix = (HeaderBlockPrefix *&)p;
+  switch (prefix->block_type) {
+  case e_shb_block_type:
+    p += prefix->block_total_length;
+    break;
+  case e_idb_block_type:
+    p += prefix->block_total_length;
+    break;
+  case e_epb_block_type:
+    std::uint8_t send = p_epb(p, pkts, truncated_pkt_cnt, idx_pkt);
+    EnhancedPacketBlock *epb = (EnhancedPacketBlock *)p;
+    p += epb->block_total_length;
+    /* This check cannot be branchless because writing to TX of a NIC cannot
+       safely execute. This path will only be true at every 64 packets, at the
+       exact 64th iter. Leftover packets after all the pcapng is parsed can be
+       handled at another check. This code should be easy to predict for the
+       branch predictor after learned, there's no compiler hints that says
+       "enter this branch every 64th time you saw it" as researched.
+    */
+    if (send == 1) {
+      // Send the packets to TX
+      idx_pkt = 0;
+    }
+    break;
   }
-  /* Maybe provide telemetry with things like that ?
-     We can read the values by fetching them with Shared state on another
-     seperate core, it's only 1 cmp + 1 add for hot path. But, will use a
-     register or cause a memory fetch?
-  */
-  std::uint32_t truncated_packet_count = 0;
-  p += idb->block_total_length;
-  /* TODO: According to specs, it looks like only enhanced packet block is used
-     at pcapng ? "Packet Block (Appendix A): it contains a single captured
-     packet, or a portion of it.  It is OBSOLETE, and superseded by the Enhanced
-     Packet Block (Section 4.3)."
-      - https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcapng/
-      Maybe only support EPB for every packet block ?  */
-  EnhancedPacketBlock *epb = (EnhancedPacketBlock *)p;
-  if (epb->block_type != e_epb_block_type) [[unlikely]] {
-    return -1;
-  }
-  /* Maybe provide telemetry with things like that ?
-     We can read the values by fetching them with Shared state on another
-     seperate core, it's only 1 cmp + 1 add for hot path. Because every epb has
-     the required values, we don't need seperate registers ( etc, keeping the
-     snap_len after idb)
-  */
-  epb->original_packet_length > epb->captured_packet_length
-      ? ++truncated_packet_count
-      : 0;
-  std::span<std::uint8_t> firstpacket(
-      p + sizeof(EnhancedPacketBlock),
-      epb->captured_packet_length); // temp. for checking firstpacket from GDB
   return 0;
 }
